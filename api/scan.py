@@ -26,6 +26,8 @@ import sys
 import json
 import threading
 import urllib.request
+import urllib.parse
+from http.server import BaseHTTPRequestHandler
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -134,7 +136,7 @@ GROUP_RUNNERS = {
 }
 
 
-def _trigger_next_group(base_url: str, current_group: str, cron_secret: str | None) -> None:
+def _trigger_next_group(base_url: str, current_group: str, cron_secret) -> None:
     """Fire-and-forget call to kick off the next group without waiting
     for it to finish -- keeps THIS invocation's response fast, and lets
     the next group run in its own fresh 10s window."""
@@ -160,40 +162,53 @@ def _trigger_next_group(base_url: str, current_group: str, cron_secret: str | No
     threading.Thread(target=_fire, daemon=True).start()
 
 
-def handler(request):
-    """Vercel Python runtime entry point."""
-    cron_secret = os.environ.get("CRON_SECRET")
-    if cron_secret:
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header != f"Bearer {cron_secret}":
-            return {"statusCode": 401, "body": json.dumps({"error": "unauthorized"})}
+class handler(BaseHTTPRequestHandler):
+    """
+    Vercel's Python runtime requires a class named `handler` that inherits
+    from BaseHTTPRequestHandler (NOT a plain function) -- this is the
+    fixed convention documented at vercel.com/docs/functions/runtimes/python.
+    """
 
-    # Which group to run -- Vercel Cron always hits this with no query
-    # param, so default to the first group; the chain triggers the rest.
-    group = request.args.get("group", GROUP_ORDER[0]) if hasattr(request, "args") else GROUP_ORDER[0]
-    if group not in GROUP_RUNNERS:
-        return {"statusCode": 400, "body": json.dumps({"error": f"unknown group '{group}'"})}
+    def do_GET(self):
+        self._handle()
 
-    try:
-        result = GROUP_RUNNERS[group]()
+    def do_POST(self):
+        self._handle()
 
-        # Chain to the next group before returning, so the full scan
-        # completes across multiple short invocations instead of one
-        # long one that would exceed Hobby's 10s cap.
-        host = request.headers.get("host", "")
-        if host:
-            _trigger_next_group(f"https://{host}", group, cron_secret)
+    def _handle(self):
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        group = query.get("group", [GROUP_ORDER[0]])[0]
 
-        result["group"] = group
-        return {
-            "statusCode": 200,
-            "headers": {"Content-Type": "application/json"},
-            "body": json.dumps(result),
-        }
-    except Exception as e:
-        print(f"[scan:{group}] FATAL: {e}")
-        return {
-            "statusCode": 500,
-            "headers": {"Content-Type": "application/json"},
-            "body": json.dumps({"error": str(e), "group": group}),
-        }
+        cron_secret = os.environ.get("CRON_SECRET")
+        if cron_secret:
+            auth_header = self.headers.get("Authorization", "")
+            if auth_header != f"Bearer {cron_secret}":
+                self._respond(401, {"error": "unauthorized"})
+                return
+
+        if group not in GROUP_RUNNERS:
+            self._respond(400, {"error": f"unknown group '{group}'"})
+            return
+
+        try:
+            result = GROUP_RUNNERS[group]()
+
+            # Chain to the next group before responding, so the full scan
+            # completes across multiple short invocations instead of one
+            # long one that would exceed Hobby's 10s cap.
+            host = self.headers.get("host", "")
+            if host:
+                _trigger_next_group(f"https://{host}", group, cron_secret)
+
+            result["group"] = group
+            self._respond(200, result)
+        except Exception as e:
+            print(f"[scan:{group}] FATAL: {e}")
+            self._respond(500, {"error": str(e), "group": group})
+
+    def _respond(self, status: int, body: dict) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(body).encode("utf-8"))
